@@ -13,6 +13,7 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Set, Tuple, Ty
 from typing_inspect import is_literal_type
 from warnings import warn
 
+from tap.config_file import ConfigFile
 from tap.utils import (
     get_class_variables,
     get_args,
@@ -416,18 +417,34 @@ class Tap(ArgumentParser):
     def parse_args(self: TapType,
                    args: Optional[Sequence[str]] = None,
                    known_only: bool = False,
-                   legacy_config_parsing = False) -> TapType:
+                   legacy_config_parsing = False,
+                   parse_runtime_config_files: bool = True) -> TapType:
         """Parses arguments, sets attributes of self equal to the parsed arguments, and processes arguments.
 
         :param args: List of strings to parse. The default is taken from `sys.argv`.
         :param known_only: If true, ignores extra arguments and only parses known arguments.
         Unparsed arguments are saved to self.extra_args.
         :legacy_config_parsing: If true, config files are parsed using `str.split` instead of `shlex.split`.
+        :parse_config_files: If true, look for args of type ConfigFile and parse those files' contents as args
         :return: self, which is a Tap instance containing all of the parsed args.
         """
         # Prevent double parsing
         if self._parsed:
             raise ValueError('parse_args can only be called once.')
+
+        runtime_config_args = []
+        if parse_runtime_config_files:
+            # collect arguments from config files specified at runtime via ConfigFile args
+            runtime_config_parser = ConfigFileParser(self)
+            config_namespace = runtime_config_parser.parse_args(args, known_only=True,
+                                                                parse_runtime_config_files=False)
+            for variable, value in vars(config_namespace).items():
+                if variable in self._annotations:
+                    if type(value) == ConfigFile:
+                        runtime_config_args += value.extract_args()
+                    elif type(value) == list:
+                        for config_file in value:
+                            runtime_config_args += config_file.extract_args()
 
         # Collect arguments from all of the configs
 
@@ -438,8 +455,10 @@ class Tap(ArgumentParser):
 
         config_args = [arg for args_from_config in self.args_from_configs for arg in splitter(args_from_config)]
 
-        # Add config args at lower precedence and extract args from the command line if they are not passed explicitly
-        args = config_args + (sys.argv[1:] if args is None else list(args))
+        # Add args from files in the config_files param to contructor at lower precedence,
+        # then add args from ConfigFiles given on cli,
+        # then extract args from the command line at highest precedence
+        args = config_args + runtime_config_args + (sys.argv[1:] if args is None else list(args))
 
         # Parse args using super class ArgumentParser's parse_args or parse_known_args function
         if known_only:
@@ -736,3 +755,24 @@ class Tap(ArgumentParser):
         """
         self.__init__()
         self.from_dict(d)
+
+
+class ConfigFileParser(Tap):
+    """
+    Parser that copies just args of type ConfigFile from another parser
+    """
+    def __init__(self, tap: Tap):
+        """
+        :param tap: parser that may contain ConfigFile arguments
+        """
+        self.tap = tap
+        super().__init__()
+
+    def configure(self):
+        """
+        add ConfigFile arguments from self.tap
+        """
+        for a in self.tap._actions:
+            if a.type == ConfigFile:
+                self.add_argument(*a.option_strings, type=ConfigFile, required=a.required,
+                                  help=a.help, default=a.default, nargs=a.nargs)
